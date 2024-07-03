@@ -8,39 +8,10 @@ import torch.nn.functional as F
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
-from ultralytics.utils.atss import ATSSAssigner, generate_anchors
 
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
 
-
-def wasserstein_loss(pred, target, eps=1e-7, mode='exp', gamma=1, constant=12.8):
-    center1 = (pred[:, :2] + pred[:, 2:]) / 2
-    center2 = (target[:, :2] + target[:, 2:]) / 2
-    whs = center1[:, :2] - center2[:, :2]
-    center_distance = whs[:, 0] * whs[:, 0] + whs[:, 1] * whs[:, 1] + eps  #
-
-    w1 = pred[:, 2] - pred[:, 0] + eps
-    h1 = pred[:, 3] - pred[:, 1] + eps
-    w2 = target[:, 2] - target[:, 0] + eps
-    h2 = target[:, 3] - target[:, 1] + eps
-
-    wh_distance = ((w1 - w2) ** 2 + (h1 - h2) ** 2) / 4
-    wasserstein_2 = center_distance + wh_distance
-
-    if mode == 'exp':
-        normalized_wasserstein = torch.exp(-torch.sqrt(wasserstein_2) / constant)
-        wloss = 1 - normalized_wasserstein
-    elif mode == 'sqrt':
-        wloss = torch.sqrt(wasserstein_2)
-    elif mode == 'log':
-        wloss = torch.log(wasserstein_2 + 1)
-    elif mode == 'norm_sqrt':
-        wloss = 1 - 1 / (gamma + torch.sqrt(wasserstein_2))
-    else:
-        #mode == 'w2':
-        wloss = wasserstein_2
-    return wloss.unsqueeze(1)
 
 class VarifocalLoss(nn.Module):
     """
@@ -105,10 +76,6 @@ class BboxLoss(nn.Module):
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True, SIoU=True)
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
-
-        nwd_loss = wasserstein_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask])
-        nwd_loss = (nwd_loss * weight).sum() / target_scores_sum
-        loss_iou = 0.5 * loss_iou + nwd_loss
 
         # DFL loss
         if self.use_dfl:
@@ -189,8 +156,6 @@ class v8DetectionLoss:
 
         m = model.model[-1]  # Detect() module
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
-        # self.bce = EMASlideLoss(nn.BCEWithLogitsLoss(reduction='none'))  # Exponential Moving Average Slide Loss
-        # self.bce = SlideLoss(nn.BCEWithLogitsLoss(reduction='none')) # Slide Loss
         self.hyp = h
         self.stride = m.stride  # model strides
         self.nc = m.nc  # number of classes
@@ -201,16 +166,8 @@ class v8DetectionLoss:
         self.use_dfl = m.reg_max > 1
 
         self.assigner = TaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
-        # if hasattr(m, 'dfl_aux'):
-        #     self.assigner_aux = TaskAlignedAssigner(topk=13, num_classes=self.nc, alpha=0.5, beta=6.0)
-        #     self.aux_loss_ratio = 0.25
-        # # self.assigner = ATSSAssigner(9, num_classes=self.nc)
         self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=self.use_dfl).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
-
-        # self.grid_cell_offset = 0.5
-        # self.fpn_strides = list(self.stride.detach().cpu().numpy())
-        # self.grid_cell_size = 5.0
 
     def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocesses the target counts and matches with the input batch size to output a tensor."""
@@ -289,153 +246,8 @@ class v8DetectionLoss:
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
-        # if hasattr(self, 'assigner_aux'):
-        #     loss, batch_size = self.compute_loss_aux(preds, batch)
-        # else:
-        #     loss, batch_size = self.compute_loss(preds, batch)
-
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
 
-    def compute_loss(self, preds, batch):
-        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
-        feats = preds[1] if isinstance(preds, tuple) else preds
-        feats = feats[:self.stride.size(0)]
-        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1)
-
-        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
-        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
-
-        dtype = pred_scores.dtype
-        batch_size = pred_scores.shape[0]
-        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
-        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
-
-        # targets
-        targets = torch.cat((batch['batch_idx'].view(-1, 1), batch['cls'].view(-1, 1), batch['bboxes']), 1)
-        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
-        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
-
-        # pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
-
-        # ATSS
-        if isinstance(self.assigner, ATSSAssigner):
-            anchors, _, n_anchors_list, _ = \
-                generate_anchors(feats, self.fpn_strides, self.grid_cell_size, self.grid_cell_offset,
-                                 device=feats[0].device)
-            _, target_bboxes, target_scores, fg_mask, _ = self.assigner(anchors, n_anchors_list, gt_labels, gt_bboxes,
-                                                                        mask_gt, pred_bboxes.detach() * stride_tensor)
-        # TAL
-        else:
-            _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
-                pred_scores.detach().sigmoid(), (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
-                anchor_points * stride_tensor, gt_labels, gt_bboxes, mask_gt)
-
-        target_scores_sum = max(target_scores.sum(), 1)
-
-        # cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        if isinstance(self.bce, nn.BCEWithLogitsLoss):
-            loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
-
-        # bbox loss
-        if fg_mask.sum():
-            target_bboxes /= stride_tensor
-            loss[0], loss[2] = self.bbox_loss(pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores,
-                                              target_scores_sum, fg_mask,
-                                              feats[0].shape[0] ** 2 + feats[0].shape[1] ** 2)
-
-        if isinstance(self.bce, (EMASlideLoss, SlideLoss)):
-            auto_iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True).mean()
-            loss[1] = self.bce(pred_scores, target_scores.to(dtype), auto_iou).sum() / target_scores_sum  # BCE
-
-        loss[0] *= self.hyp.box  # box gain
-        loss[1] *= self.hyp.cls  # cls gain
-        loss[2] *= self.hyp.dfl  # dfl gain
-        return loss, batch_size
-
-    def compute_loss_aux(self, preds, batch):
-        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
-        feats_all = preds[1] if isinstance(preds, tuple) else preds
-        if len(feats_all) == self.stride.size(0):
-            return self.compute_loss(preds, batch)
-        feats, feats_aux = feats_all[:self.stride.size(0)], feats_all[self.stride.size(0):]
-
-        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1)
-        pred_distri_aux, pred_scores_aux = torch.cat([xi.view(feats_aux[0].shape[0], self.no, -1) for xi in feats_aux],
-                                                     2).split((self.reg_max * 4, self.nc), 1)
-
-        pred_scores, pred_distri = pred_scores.permute(0, 2, 1).contiguous(), pred_distri.permute(0, 2, 1).contiguous()
-        pred_scores_aux, pred_distri_aux = pred_scores_aux.permute(0, 2, 1).contiguous(), pred_distri_aux.permute(0, 2,
-                                                                                                                  1).contiguous()
-
-        dtype = pred_scores.dtype
-        batch_size = pred_scores.shape[0]
-        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
-        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
-
-        # targets
-        targets = torch.cat((batch['batch_idx'].view(-1, 1), batch['cls'].view(-1, 1), batch['bboxes']), 1)
-        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
-        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
-
-        # pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
-        pred_bboxes_aux = self.bbox_decode(anchor_points, pred_distri_aux)  # xyxy, (b, h*w, 4)
-
-        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(pred_scores.detach().sigmoid(),
-                                                                    (pred_bboxes.detach() * stride_tensor).type(
-                                                                        gt_bboxes.dtype),
-                                                                    anchor_points * stride_tensor, gt_labels, gt_bboxes,
-                                                                    mask_gt)
-        _, target_bboxes_aux, target_scores_aux, fg_mask_aux, _ = self.assigner_aux(pred_scores.detach().sigmoid(), (
-                    pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
-                                                                                    anchor_points * stride_tensor,
-                                                                                    gt_labels, gt_bboxes, mask_gt)
-
-        target_scores_sum = max(target_scores.sum(), 1)
-        target_scores_sum_aux = max(target_scores_aux.sum(), 1)
-
-        # cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        if isinstance(self.bce, nn.BCEWithLogitsLoss):
-            loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
-            loss[1] += self.bce(pred_scores_aux,
-                                target_scores_aux.to(dtype)).sum() / target_scores_sum_aux * self.aux_loss_ratio  # BCE
-
-        # bbox loss
-        if fg_mask.sum():
-            target_bboxes /= stride_tensor
-            target_bboxes_aux /= stride_tensor
-            loss[0], loss[2] = self.bbox_loss(pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores,
-                                              target_scores_sum, fg_mask,
-                                              feats[0].shape[0] ** 2 + feats[0].shape[1] ** 2)
-            aux_loss_0, aux_loss_2 = self.bbox_loss(pred_distri_aux, pred_bboxes_aux, anchor_points, target_bboxes_aux,
-                                                    target_scores_aux,
-                                                    target_scores_sum_aux, fg_mask_aux,
-                                                    feats_aux[0].shape[0] ** 2 + feats_aux[0].shape[1] ** 2)
-
-            loss[0] += aux_loss_0 * self.aux_loss_ratio
-            loss[2] += aux_loss_2 * self.aux_loss_ratio
-
-        if isinstance(self.bce, (EMASlideLoss, SlideLoss)):
-            auto_iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True).mean()
-            loss[1] = self.bce(pred_scores, target_scores.to(dtype), auto_iou).sum() / target_scores_sum  # BCE
-            loss[1] += self.bce(pred_scores_aux, target_scores_aux.to(dtype),
-                                -1).sum() / target_scores_sum_aux * self.aux_loss_ratio  # BCE
-
-        loss[0] *= self.hyp.box  # box gain
-        loss[1] *= self.hyp.cls  # cls gain
-        loss[2] *= self.hyp.dfl  # dfl gain
-
-        # return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
-        return loss, batch_size
 
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses."""
@@ -784,68 +596,6 @@ class v8ClassificationLoss:
         loss = torch.nn.functional.cross_entropy(preds, batch["cls"], reduction="mean")
         loss_items = loss.detach()
         return loss, loss_items
-
-class SlideLoss(nn.Module):
-    def __init__(self, loss_fcn):
-        super(SlideLoss, self).__init__()
-        self.loss_fcn = loss_fcn
-        self.reduction = loss_fcn.reduction
-        self.loss_fcn.reduction = 'none'  # required to apply SL to each element
-
-    def forward(self, pred, true, auto_iou=0.5):
-        loss = self.loss_fcn(pred, true)
-        if auto_iou < 0.2:
-            auto_iou = 0.2
-        b1 = true <= auto_iou - 0.1
-        a1 = 1.0
-        b2 = (true > (auto_iou - 0.1)) & (true < auto_iou)
-        a2 = math.exp(1.0 - auto_iou)
-        b3 = true >= auto_iou
-        a3 = torch.exp(-(true - 1.0))
-        modulating_weight = a1 * b1 + a2 * b2 + a3 * b3
-        loss *= modulating_weight
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:  # 'none'
-            return loss
-
-
-class EMASlideLoss:
-    def __init__(self, loss_fcn, decay=0.999, tau=2000):
-        super(EMASlideLoss, self).__init__()
-        self.loss_fcn = loss_fcn
-        self.reduction = loss_fcn.reduction
-        self.loss_fcn.reduction = 'none'  # required to apply SL to each element
-        self.decay = lambda x: decay * (1 - math.exp(-x / tau))
-        self.is_train = True
-        self.updates = 0
-        self.iou_mean = 1.0
-
-    def __call__(self, pred, true, auto_iou=0.5):
-        if self.is_train and auto_iou != -1:
-            self.updates += 1
-            d = self.decay(self.updates)
-            self.iou_mean = d * self.iou_mean + (1 - d) * float(auto_iou.detach())
-        auto_iou = self.iou_mean
-        loss = self.loss_fcn(pred, true)
-        if auto_iou < 0.2:
-            auto_iou = 0.2
-        b1 = true <= auto_iou - 0.1
-        a1 = 1.0
-        b2 = (true > (auto_iou - 0.1)) & (true < auto_iou)
-        a2 = math.exp(1.0 - auto_iou)
-        b3 = true >= auto_iou
-        a3 = torch.exp(-(true - 1.0))
-        modulating_weight = a1 * b1 + a2 * b2 + a3 * b3
-        loss *= modulating_weight
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:  # 'none'
-            return loss
 
 class v8OBBLoss(v8DetectionLoss):
     def __init__(self, model):
